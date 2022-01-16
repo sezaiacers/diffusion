@@ -1,10 +1,6 @@
 import glob
 import os
 
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
-
 from absl import logging
 import flax
 import jax
@@ -161,7 +157,6 @@ def get_data(*,
     if num_devices is not None:
         data = data.map(_shard, tf.data.experimental.AUTOTUNE)
     return data.prefetch(1)
-
 
 def prefetch(dataset, n_prefetch):
     ds_iter = iter(dataset)

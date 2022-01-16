@@ -186,13 +186,14 @@ class GaussianDiffusion:
                  x_t,
                  timesteps,
                  noise_fn,
+                 rng,
                  mean_type,
                  var_type,
                  clip_denoised):
 
         mean, var, log_var, x_0 = self.p_mean_variance(
             denoise_fn, x_t, timesteps, mean_type, var_type, clip_denoised)
-        noise = noise_fn(shape=x_t.shape, dtype=x_t.dtype)
+        noise = noise_fn(rng, shape=x_t.shape, dtype=x_t.dtype)
 
         mask = jnp.reshape(1.0 - jnp.asarray(jnp.equal(timesteps, 0)),
                            [x_t.shape[0]] + [1] * (len(x_t.shape) - 1))
@@ -202,23 +203,30 @@ class GaussianDiffusion:
     def p_sample_loop(self,
                       denoise_fn,
                       noise_fn,
+                      rng,
                       shape,
                       mean_type,
                       var_type,
                       clip_denoised):
 
-        x_t = noise_fn(shape=shape, dtype=jnp.float32)
+        rng, key = jax.random.split(rng)
+
+        x_t = noise_fn(key, shape=shape, dtype=jnp.float32)
         i_t = self.num_timesteps - 1
 
-        i_0, x_0 = jax.lax.while_loop(
-            lambda x: x[0] > 0,
-            lambda x: (
-                x[0] - 1,
-                self.p_sample(denoise_fn, x[1], jnp.full([shape[0]], x[0]), noise_fn,
-                              mean_type, var_type, clip_denoised)[0]
-            ),
-            (i_t, x_t))
-        return x_0
+        def cond_fun(inputs):
+            i_t, x_t, rng = inputs
+            return i_t >= 0
+
+        def body_fun(inputs):
+            i_t, x_t, rng = inputs
+            rng, key = jax.random.split(rng)
+            timesteps = jnp.full([shape[0]], i_t)
+            xprev = self.p_sample(denoise_fn, x_t,
+                                  timesteps, noise_fn, key,
+                                  mean_type, var_type, clip_denoised)[0]
+            return i_t - 1, xprev, rng
+        return jax.lax.while_loop(cond_fun, body_fun, (i_t, x_t, rng))[1]
 
     @staticmethod
     def _extract(x, timesteps, broadcast_shape):

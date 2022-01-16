@@ -3,6 +3,13 @@ from absl import flags
 from absl import logging
 from clu import platform
 
+
+try:
+    import jax.tools.colab_tpu
+    jax.tools.colab_tpu.setup_tpu()
+except:
+    pass
+
 import jax
 from ml_collections import config_flags
 import tensorflow as tf
@@ -36,7 +43,8 @@ def main(argv):
   platform.work_unit().create_artifact(platform.ArtifactType.DIRECTORY,
                                        FLAGS.workdir, 'workdir')
 
-  train.train_and_sample(FLAGS.config, FLAGS.workdir)
+  #train.train_and_sample(FLAGS.config, FLAGS.workdir)
+  print(FLAGS.config)
 
 
 if __name__ == '__main__':
