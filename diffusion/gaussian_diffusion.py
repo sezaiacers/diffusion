@@ -22,7 +22,7 @@ class LossType(enum.Enum):
 
 class GaussianDiffusion:
 
-    def __init__(self, betas):
+    def __init__(self, betas, mean_type=None, var_type=None, loss_type=None):
         assert (betas > 0).all() and (betas <= 1).all()
 
         self.betas = betas
@@ -49,6 +49,10 @@ class GaussianDiffusion:
             jnp.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod))
         self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * (
             jnp.sqrt(alphas) / (1. - self.alphas_cumprod))
+
+        self.mean_type = mean_type
+        self.var_type = var_type
+        self.loss_type = loss_type
 
     def q_mean_variance(self, x_0, timesteps):
         #  q(x{t} | x{0})
@@ -108,13 +112,17 @@ class GaussianDiffusion:
         )
 
     def compute_loss(self,
-                     denoise_fn,
                      x_0,
-                     timesteps,
                      noise,
-                     loss_type,
-                     mean_type,
-                     var_type):
+                     timesteps,
+                     output,
+                     mean_type=None,
+                     var_type=None,
+                     loss_type=None):
+
+        loss_type = loss_type and self.loss_type
+        mean_type = mean_type and self.mean_type
+        var_type = var_type and self.var_type
 
         assert loss_type == LossType.MSE
         assert var_type != VarType.LEARNED
@@ -130,19 +138,20 @@ class GaussianDiffusion:
             target = noise
         else:
             raise NotImplementedError(mean_type)
-
-        output = denoise_fn(x_t, timesteps)
         return jnp.mean((target - output) ** 2)
 
     def p_mean_variance(self,
                         denoise_fn,
                         x_t,
                         timesteps,
-                        mean_type,
-                        var_type,
-                        clip_denoised):
+                        mean_type=None,
+                        var_type=None,
+                        clip_denoised=True):
 
         # p(x{t-1})
+
+        mean_type = mean_type and self.mean_type
+        var_type = var_type and self.var_type
 
         broadcast_shape = x_t.shape
         ones_like_x_t = jnp.ones_like(x_t)
@@ -187,9 +196,12 @@ class GaussianDiffusion:
                  timesteps,
                  noise_fn,
                  rng,
-                 mean_type,
-                 var_type,
-                 clip_denoised):
+                 mean_type=None,
+                 var_type=None,
+                 clip_denoised=True):
+
+        mean_type = mean_type and self.mean_type
+        var_type = var_type and self.var_type
 
         mean, var, log_var, x_0 = self.p_mean_variance(
             denoise_fn, x_t, timesteps, mean_type, var_type, clip_denoised)
@@ -205,9 +217,12 @@ class GaussianDiffusion:
                       noise_fn,
                       rng,
                       shape,
-                      mean_type,
-                      var_type,
-                      clip_denoised):
+                      mean_type=None,
+                      var_type=None,
+                      clip_denoised=True):
+
+        mean_type = mean_type and self.mean_type
+        var_type = var_type and self.var_type
 
         rng, key = jax.random.split(rng)
 
@@ -233,6 +248,15 @@ class GaussianDiffusion:
         shape = [broadcast_shape[0]] + [1] * (len(broadcast_shape) - 1)
         y = jnp.take(x, timesteps)
         return jnp.reshape(y, shape)
+
+    @staticmethod
+    def from_config(config):
+        betas = get_beta_schedule(config.schedule_type, config.start,
+                                  config.end, config.num_timesteps)
+        loss_type = LossType[config.loss_type.upper()]
+        mean_type = MeanType[config.mean_type.upper()]
+        var_type  = VarType[config.var_type.upper()]
+        return GaussianDiffusion(betas, mean_type, var_type, loss_type)
 
 
 def get_beta_schedule(schedule_type, start, end, num_timesteps):

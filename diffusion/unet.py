@@ -103,8 +103,6 @@ def attention_block(inputs, time_emb):
     return inputs + outputs
 
 
-
-
 class UNetModel(nn.Module):
     num_classes: int
     out_ch: int
@@ -116,9 +114,8 @@ class UNetModel(nn.Module):
     resamp_with_conv: bool
 
     @nn.compact
-    def __call__(self, inputs, timesteps, labels, train):
-        assert self.num_classes == 1 and labels is None
-        del labels
+    def __call__(self, *, inputs, timesteps, labels, train):
+        assert self.num_classes == 1
 
         time_emb = timestep_embedding(timesteps, self.ch)
         time_emb = dense(time_emb, self.ch * 3, scale=1.0)

@@ -1,8 +1,6 @@
 from diffusion.unet import UNetModel
 
 from diffusion.gaussian_diffusion import GaussianDiffusion
-from diffusion.gaussian_diffusion import get_beta_schedule
-from diffusion.gaussian_diffusion import MeanType, VarType, LossType
 from diffusion import input_pipeline
 
 import numpy as np
@@ -22,22 +20,62 @@ from flax import jax_utils
 
 from flax import optim
 
-import ml_collections
-
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import functools
-
 import time
 
-def train_and_sample(config: ml_collections.ConfigDict, workdir: str):
-    tf.io.gfile.makedirs(workdir)
 
-    rng = jax.random.PRNGKey(config.seed)
+def make_update_fn(apply_fn,
+                   criterion,
+                   num_timesteps,
+                   decay,
+                   grad_norm_clip);
 
-    train_ds, valid_ds = input_pipeline.get_datasets(config)
+    def update_fn(opt, params, step, batch, rng):
+        rng, noise_rng, timesteps_rng, dropout_rng = jax.random.split(rng, 4)
 
+        inputs, labels = batch['image'], batch['label']
+
+        noise = jax.random.normal(noise_key, inputs.shape)
+        timesteps = jax.random.randint(timesteps_rng,
+                                       minval=0, maxval=num_timesteps,
+                                       shape=(inputs[0], ), dtype=jnp.int32)
+        def loss_fn(params):
+            params, rngs = dict(params=params), dict(dropout=dropout_rng)
+            output = apply_fn(params, rngs=rngs inputs=inputs,
+                              labels=labels, timesteps=timesteps, train=True)
+            return criterion(inputs, noise, timesteps, outputs)
+
+        grad_fn = jax.value_and_grad(loss_fn)
+        loss, grad = grad_fn(optimizer.target)
+
+        loss = jax.lax.pmean(loss, 'batch')
+        grad = jax.lax.pmean(grad, 'batch')
+
+        grad_norm = jnp.sqrt(
+            jax.tree_util.tree_reduce(
+                lambda x, y: x + jnp.sum(y**2), grad, initializer=0.0))
+        mult = jnp.minimum(1.0, grad_norm_clip / (1e-7 + grad_norm))
+        grad = jax.tree_util.tree_map(lambda z: mult * z, grad)
+
+        opt = opt.apply_gradient(grad)
+
+        params = jax.tree_multimap(
+            lambda shadow_variable, variable : decay * shadow_variable + (1 - decay) * variable,
+            params, opt.target)
+
+        return opt, params, rng, loss
+
+    return jax.pmap(update_fn, axis_name='batch')
+
+
+def make_sample_fn(*, apply_fn, num_timesteps):
+    pass
+
+
+def init_model(config, rng):
     model = UNetModel(
         config.num_classes,
         config.out_ch,
@@ -49,95 +87,44 @@ def train_and_sample(config: ml_collections.ConfigDict, workdir: str):
         config.resamp_with_conv,
     )
 
-    rng, init_rng, dropout_rng = jax.random.split(rng, 3)
+    init_rng, dropout_rng = jax.random.split(rng)
+    init_fn = lambda: model.init(
+        dict(params=init_rng, dropout=dropout_rng),
+        inputs=jnp.ones((1, config.image_size, config.image_size, 3)),
+        labels=None,
+        timesteps=jnp.arange(config.batch),
+        train=True)
+    variables = jax.jit(init_fn, backend='cpu')()
+    return model.apply_fn, variables
 
-    input_shape = (config.batch, config.image_size, config.image_size, 3)
 
-    # Use JIT to make sure params reside in CPU memory.
-    variables = jax.jit(
-        lambda: model.init({'params': init_rng, 'dropout': dropout_rng},
-                           jnp.ones(input_shape),
-                           jnp.arange(config.batch),
-                           None,
-                           True),
-        backend='cpu')()
+def train_and_sample(config, workdir):
+    tf.io.gfile.makedirs(workdir)
 
-    optimizer_def = optim.Adam(config.lr, eps=config.eps)
-    optimizer = optimizer_def.create(variables)
+    rng = jax.random.PRNGKey(config.seed)
+    rng, init_rng = jax.random.split(rng, 3)
+
+    train_ds, valid_ds = input_pipeline.get_datasets(config)
+    diffusion = GaussianDiffusion.from_config(config)
+
+    apply_fn, params = init_model(config, init_rng)
+
+    opt = optim.Adam(config.lr, eps=config.eps).create(params)
 
     initial_step, total_steps = 1, config.total_steps
-    optimizer, ema, initial_step = flax_checkpoints.restore_checkpoint(
-        workdir, (optimizer, variables, initial_step))
+    opt, params, initial_step = flax_checkpoints.restore_checkpoint(
+        workdir, (opt, params, initial_step))
     logging.info('Will start/continue training at initial_step=%d', initial_step)
 
-    optimizer, ema = jax_utils.replicate((optimizer, ema))
+    opt_repl = flax.jax_utils.replicate(opt)
+    params_repl = flax.jax_utils.replicate(params_repl)
+    update_rng_repl = flax.jax_utils.replicate(rng)
+    update_fn_repl = make_update_fn(apply_fn, diffusion.compute_loss,
+                                    config.num_timesteps, config.decay,
+                                    config.grad_norm_clip)
 
-    diffusion = GaussianDiffusion(get_beta_schedule(
-        config.schedule_type, config.start, config.end, config.num_timesteps))
-
-    loss_type = LossType[config.loss_type.upper()]
-    mean_type = MeanType[config.mean_type.upper()]
-    var_type  = VarType[config.var_type.upper()]
-
-    ema_decay = config.ema_decay
-
-    shape = (8, 32, 32, 3)
-    def sample(params, rng):
-        rng, noise_rng = jax.random.split(rng)
-        denoise_fn = lambda xs, ts: model.apply(
-            params, xs, ts, None, False, rngs={'dropout': rng})
-        x_0 = diffusion.p_sample_loop(denoise_fn, jax.random.normal, noise_rng,
-                                       shape, mean_type, var_type, True)
-        return jnp.asarray(x_0 * 127.5 + 127.5, jnp.uint8)[..., ::-1]
-
-    sample = jax.pmap(sample, axis_name='batch')
-
-
-    '''
-    import cv2 as cv
-    import os
-    os.makedirs('images', exist_ok=True)
-    for i, image in enumerate(out):
-        cv.imwrite('images/{}.jpg'.format(i), image)
-    '''
-
-    def train_step(optimizer, ema, xs, ts, noise, rng):
-        denoise_fn = lambda params, xs, ts: model.apply(
-            params, xs, ts, None, True, rngs={'dropout': rng})
-
-        loss_fn = lambda params: diffusion.compute_loss(
-            functools.partial(denoise_fn, params), xs, ts, noise, loss_type, mean_type, var_type)
-
-        grad_fn = jax.value_and_grad(loss_fn)
-        loss, grad = grad_fn(optimizer.target)
-
-        loss = jax.lax.pmean(loss, 'batch')
-        grad = jax.lax.pmean(grad, 'batch')
-
-        if config.grad_norm_clip > 0.0:
-            grad_norm = jnp.sqrt(
-                jax.tree_util.tree_reduce(
-                     lambda x, y: x + jnp.sum(y**2), grad, initializer=0))
-            mult = jnp.minimum(1, config.grad_norm_clip / (1e-7 + grad_norm))
-            grad = jax.tree_util.tree_map(lambda z: mult * z, grad)
-
-        optimizer = optimizer.apply_gradient(grad)
-
-        ema = jax.tree_multimap(lambda ema, p: ema * ema_decay + (1 - ema_decay) * p,
-                                ema, optimizer.target)
-
-        return optimizer, ema, loss
-
-    train_step = jax.pmap(train_step, axis_name='batch')
-
-    n_devices = jax.device_count()
-    input_size = (n_devices, config.batch // n_devices,
-                  config.image_size, config.image_size, 3)
-
-    noise_shape = (n_devices, config.batch // n_devices,
-                   config.image_size, config.image_size, 3)
-    ts_shape = (n_devices, config.batch // n_devices)
-
+    del opt
+    del params
 
     # Setup metric writer & hooks.
     writer = metric_writers.create_default_writer(workdir, asynchronous=False)
@@ -152,23 +139,15 @@ def train_and_sample(config: ml_collections.ConfigDict, workdir: str):
     t0 = lt0 = time.time()
     lstep = initial_step
 
-    import os
-    import cv2 as cv
-    images_dirname = 'images'
-    os.makedirs(images_dirname, exist_ok=True)
-
+    update_rng_repl = flax.jax_utils.replicate(jax.random.PRNGKey(0))
     for step, batch in zip(
         range(initial_step, total_steps + 1),
             input_pipeline.prefetch(train_ds, config.prefetch)):
 
         with jax.profiler.StepTraceContext('train', step_num=step):
-            rng, step_rng, noise_key, ts_key = jax.random.split(rng, 4)
-            sharded_rngs = common_utils.shard_prng_key(step_rng)
-            noise = jax.random.normal(noise_key, noise_shape)
-            ts = jax.random.randint(ts_key, shape=ts_shape, dtype=jnp.int32,
-                                    minval=0, maxval=config.num_timesteps)
-            xs = batch['image']
-            optimizer, ema, loss = train_step(optimizer, ema, xs, ts, noise, sharded_rngs)
+            step_repl = flax.jax_utils.replicate(step)
+            opt_repl, params_repl, update_rng_repl, loss_repl = update_fn_repl(
+                opt_repl, params_repl, step_repl, batch, update_rng_repl)
 
         for hook in hooks:
             hook(step)
@@ -179,6 +158,7 @@ def train_and_sample(config: ml_collections.ConfigDict, workdir: str):
             lt0, lstep = time.time(), step
 
         if config.generate_every and step % config.generate_every == 0:
+            '''
             rng, step_rng = jax.random.split(rng)
             sharded_rngs = common_utils.shard_prng_key(step_rng)
             x_0 = flax.jax_utils.unreplicate(sample(ema, sharded_rngs))
@@ -188,6 +168,7 @@ def train_and_sample(config: ml_collections.ConfigDict, workdir: str):
             for i, image in enumerate(x_0):
                 cv.imwrite(os.path.join(dirname, '{}.jpg'.format(i)), image)
 
+            '''
         # Report training metrics
         if config.progress_every and step % config.progress_every == 0:
             img_sec_core_train = (config.batch * (step - lstep) /
