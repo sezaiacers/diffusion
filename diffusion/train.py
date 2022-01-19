@@ -31,7 +31,7 @@ def make_update_fn(apply_fn,
                    criterion,
                    num_timesteps,
                    decay,
-                   grad_norm_clip);
+                   grad_norm_clip):
 
     def update_fn(opt, params, step, batch, rng):
         rng, noise_rng, timesteps_rng, dropout_rng = jax.random.split(rng, 4)
@@ -44,7 +44,7 @@ def make_update_fn(apply_fn,
                                        shape=(inputs[0], ), dtype=jnp.int32)
         def loss_fn(params):
             params, rngs = dict(params=params), dict(dropout=dropout_rng)
-            output = apply_fn(params, rngs=rngs inputs=inputs,
+            output = apply_fn(params, rngs=rngs, inputs=inputs,
                               labels=labels, timesteps=timesteps, train=True)
             return criterion(inputs, noise, timesteps, outputs)
 
