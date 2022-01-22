@@ -43,8 +43,7 @@ def main(argv):
   platform.work_unit().create_artifact(platform.ArtifactType.DIRECTORY,
                                        FLAGS.workdir, 'workdir')
 
-  #train.train_and_sample(FLAGS.config, FLAGS.workdir)
-  print(FLAGS.config)
+  train.train_and_sample(FLAGS.config, FLAGS.workdir)
 
 
 if __name__ == '__main__':

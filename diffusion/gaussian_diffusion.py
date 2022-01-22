@@ -2,7 +2,6 @@ import jax.numpy as jnp
 import jax
 import enum
 
-
 class MeanType(enum.Enum):
     PREVIOUS_X = enum.auto()
     START_X = enum.auto()
@@ -120,9 +119,11 @@ class GaussianDiffusion:
                      var_type=None,
                      loss_type=None):
 
-        loss_type = loss_type and self.loss_type
-        mean_type = mean_type and self.mean_type
-        var_type = var_type and self.var_type
+        loss_type = loss_type or self.loss_type
+        mean_type = mean_type or self.mean_type
+        var_type = var_type or self.var_type
+
+        assert loss_type and mean_type and var_type
 
         assert loss_type == LossType.MSE
         assert var_type != VarType.LEARNED
@@ -150,8 +151,10 @@ class GaussianDiffusion:
 
         # p(x{t-1})
 
-        mean_type = mean_type and self.mean_type
-        var_type = var_type and self.var_type
+        mean_type = mean_type or self.mean_type
+        var_type = var_type or self.var_type
+
+        assert mean_type and var_type
 
         broadcast_shape = x_t.shape
         ones_like_x_t = jnp.ones_like(x_t)
@@ -200,8 +203,10 @@ class GaussianDiffusion:
                  var_type=None,
                  clip_denoised=True):
 
-        mean_type = mean_type and self.mean_type
-        var_type = var_type and self.var_type
+        mean_type = mean_type or self.mean_type
+        var_type = var_type or self.var_type
+
+        assert mean_type and var_type
 
         mean, var, log_var, x_0 = self.p_mean_variance(
             denoise_fn, x_t, timesteps, mean_type, var_type, clip_denoised)
@@ -221,8 +226,10 @@ class GaussianDiffusion:
                       var_type=None,
                       clip_denoised=True):
 
-        mean_type = mean_type and self.mean_type
-        var_type = var_type and self.var_type
+        mean_type = mean_type or self.mean_type
+        var_type = var_type or self.var_type
+
+        assert mean_type and var_type
 
         rng, key = jax.random.split(rng)
 
@@ -241,7 +248,8 @@ class GaussianDiffusion:
                                   timesteps, noise_fn, key,
                                   mean_type, var_type, clip_denoised)[0]
             return i_t - 1, xprev, rng
-        return jax.lax.while_loop(cond_fun, body_fun, (i_t, x_t, rng))[1]
+        _, x_0, rng = jax.lax.while_loop(cond_fun, body_fun, (i_t, x_t, rng))
+        return rng, x_0
 
     @staticmethod
     def _extract(x, timesteps, broadcast_shape):
@@ -250,9 +258,11 @@ class GaussianDiffusion:
         return jnp.reshape(y, shape)
 
     @staticmethod
-    def from_config(config):
-        betas = get_beta_schedule(config.schedule_type, config.start,
-                                  config.end, config.num_timesteps)
+    def get_diffusion(config):
+        betas = get_beta_schedule(config.schedule_type,
+                                  config.start,
+                                  config.end,
+                                  config.num_timesteps)
         loss_type = LossType[config.loss_type.upper()]
         mean_type = MeanType[config.mean_type.upper()]
         var_type  = VarType[config.var_type.upper()]
